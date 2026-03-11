@@ -1,0 +1,106 @@
+﻿#include <iostream>
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <chrono>
+
+class ThreadPool {
+public:
+    ThreadPool(size_t num_threads) : stop(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] {
+                            return stop || !tasks.empty();
+                            });
+
+                        if (stop && tasks.empty()) return;
+
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+
+                    task();
+                }
+                });
+        }
+    }
+
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args)
+        -> std::future<typename std::result_of<F(Args...)>::type> {
+
+        using return_type = typename std::result_of<F(Args...)>::type;
+
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+
+        std::future<return_type> result = task->get_future();
+
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            tasks.emplace([task]() { (*task)(); });
+        }
+
+        condition.notify_one();
+        return result;
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread& worker : workers) worker.join();
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
+// Функция вычисления факториала
+long long factorial(int n) {
+    long long result = 1;
+    for (int i = 2; i <= n; ++i) {
+        result *= i;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); 
+    }
+    return result;
+}
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+    // Создаём пул из 4 потоков
+    ThreadPool pool(4);
+    std::cout << "Создан пул из 4 потоков" << std::endl;
+
+    // Добавляем 20 задач
+    std::vector<std::future<long long>> results;
+
+    std::cout << "Добавление 20 задач " << std::endl;
+    for (int i = 1; i <= 20; ++i) {
+        results.push_back(pool.enqueue(factorial, i));
+    }
+
+    std::cout << "\nРезультаты:" << std::endl;
+    for (int i = 0; i < 20; ++i) {
+        long long fact = results[i].get();
+        std::cout << i + 1 << "! = " << fact << std::endl;
+    }
+
+    return 0;
+}
