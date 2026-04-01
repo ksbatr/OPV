@@ -1,0 +1,59 @@
+﻿#include <omp.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+    const int N = 10000000; 
+    std::vector<double> arr(N);
+
+    for (int i = 0; i < N; ++i) {
+        arr[i] = i * 0.5;
+    }
+
+    double sum_seq = 0.0;
+    double sum_par = 0.0;
+
+
+    auto start_seq = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < N; ++i) {
+        sum_seq += arr[i];
+    }
+
+    auto end_seq = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed_seq = end_seq - start_seq;
+
+    std::cout << "Последовательная версия:" << std::endl;
+    std::cout << "  Сумма элементов = " << sum_seq << std::endl;
+    std::cout << "  Время выполнения = " << elapsed_seq.count() << " секунд" << std::endl;
+
+    auto start_par = std::chrono::high_resolution_clock::now();
+
+#pragma omp parallel for reduction(+:sum_par)
+    for (int i = 0; i < N; ++i) {
+        sum_par += arr[i];
+    }
+
+    auto end_par = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed_par = end_par - start_par;
+
+    std::cout << "\nПараллельная версия (OpenMP):" << std::endl;
+    std::cout << "  Сумма элементов = " << sum_par << std::endl;
+    std::cout << "  Время выполнения = " << elapsed_par.count() << " секунд" << std::endl;
+
+
+    double speedup = elapsed_seq.count() / elapsed_par.count();
+    std::cout << "\nУскорение (Speedup) = " << speedup << "x" << std::endl;
+
+
+    if (std::abs(sum_seq - sum_par) > 1e-9) {
+        std::cout << "Ошибка: результаты не совпадают!" << std::endl;
+    }
+    else {
+        std::cout << "Результаты совпадают. Вычисление выполнено корректно." << std::endl;
+    }
+
+    return 0;
+}
