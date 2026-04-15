@@ -1,0 +1,328 @@
+﻿#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+
+    // Загружаем каскады
+    cv::CascadeClassifier faceCascade;
+    cv::CascadeClassifier eyeCascade;
+    cv::CascadeClassifier smileCascade;
+
+    if (!faceCascade.load("haarcascade_frontalface_default.xml")) {
+        std::cerr << "Ошибка загрузки каскада лиц\n";
+        system("pause");
+        return -1;
+    }
+    if (!eyeCascade.load("haarcascade_eye.xml")) {
+        std::cerr << "Ошибка загрузки каскада глаз\n";
+        system("pause");
+        return -1;
+    }
+    if (!smileCascade.load("haarcascade_smile.xml")) {
+        std::cerr << "Ошибка загрузки каскада улыбок\n";
+        system("pause");
+        return -1;
+    }
+
+    cv::VideoCapture cap("ZUA.mp4");
+    if (!cap.isOpened()) {
+        std::cerr << "Ошибка открытия видеофайла\n";
+        std::cerr << "Проверьте, что файл ZUA.mp4 находится в папке с программой\n";
+        system("pause");
+        return -1;
+    }
+
+    int frameWidth = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int frameHeight = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double videoFps = cap.get(cv::CAP_PROP_FPS);
+    if (videoFps <= 0) videoFps = 30.0;
+
+    // ===== НАСТРОЙКА СОХРАНЕНИЯ ВИДЕО =====
+    cv::VideoWriter videoWriter;
+    int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');  // Кодек MJPG
+    std::string outputFilename = "output_video.avi";
+
+    videoWriter.open(outputFilename, fourcc, videoFps, cv::Size(frameWidth, frameHeight), true);
+
+    if (!videoWriter.isOpened()) {
+        std::cerr << "Ошибка создания видеофайла для записи\n";
+        std::cerr << "Пробуем другой кодек...\n";
+
+        // Пробуем другой кодек
+        fourcc = cv::VideoWriter::fourcc('X', 'V', 'I', 'D');
+        videoWriter.open(outputFilename, fourcc, videoFps, cv::Size(frameWidth, frameHeight), true);
+
+        if (!videoWriter.isOpened()) {
+            std::cerr << "Не удалось создать видеофайл. Продолжаем без сохранения.\n";
+        }
+        else {
+            std::cout << "Видео будет сохранено в: " << outputFilename << "\n";
+        }
+    }
+    else {
+        std::cout << "Видео будет сохранено в: " << outputFilename << "\n";
+    }
+
+    cv::Mat frame, gray, smallFrame;
+    bool paused = false;
+
+    const float SCALE = 0.3f;
+    int smallW = static_cast<int>(frameWidth * SCALE);
+    int smallH = static_cast<int>(frameHeight * SCALE);
+    float scaleBack = 1.0f / SCALE;
+
+    double fps = 0.0;
+    int frameCount = 0;
+    int64 startTick = cv::getTickCount();
+    int frameNumber = 0;
+
+    std::vector<cv::Rect> cachedFaces;
+
+    const int FACE_DETECT_INTERVAL = 5;
+
+    const double FACE_SCALE_FACTOR = 1.3;
+    const int FACE_MIN_NEIGHBORS = 6;
+    const int FACE_MIN_SIZE = 50;
+
+
+    unsigned int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4;
+
+
+    std::vector<cv::CascadeClassifier> threadEyeCascades(numThreads);
+    std::vector<cv::CascadeClassifier> threadSmileCascades(numThreads);
+
+    for (unsigned int i = 0; i < numThreads; ++i) {
+        threadEyeCascades[i].load("haarcascade_eye.xml");
+        threadSmileCascades[i].load("haarcascade_smile.xml");
+    }
+
+    std::cout << "Запуск с " << numThreads << " потоками\n";
+    std::cout << "Управление: ПРОБЕЛ - пауза, S - скриншот, ESC - выход\n";
+
+    while (true) {
+        if (!paused) {
+            cap >> frame;
+            if (frame.empty()) {
+                std::cout << "Конец видео\n";
+                break;
+            }
+            frameNumber++;
+            frameCount++;
+        }
+
+        cv::resize(frame, smallFrame, cv::Size(smallW, smallH));
+        cv::cvtColor(smallFrame, gray, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(gray, gray);
+
+        std::vector<cv::Rect> faces;
+
+        if (frameNumber % FACE_DETECT_INTERVAL == 0 || cachedFaces.empty()) {
+            faceCascade.detectMultiScale(
+                gray,
+                faces,
+                FACE_SCALE_FACTOR,
+                FACE_MIN_NEIGHBORS,
+                0,
+                cv::Size(FACE_MIN_SIZE, FACE_MIN_SIZE)
+            );
+
+            cachedFaces.clear();
+            for (const auto& f : faces) {
+                cv::Rect scaled(
+                    static_cast<int>(f.x * scaleBack),
+                    static_cast<int>(f.y * scaleBack),
+                    static_cast<int>(f.width * scaleBack),
+                    static_cast<int>(f.height * scaleBack)
+                );
+                cachedFaces.push_back(scaled);
+            }
+        }
+
+        faces = cachedFaces;
+
+        for (const auto& face : faces) {
+            cv::rectangle(frame, face, cv::Scalar(0, 255, 0), 2);
+            cv::putText(frame, "", cv::Point(face.x, face.y - 8),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+        }
+
+
+        if (!faces.empty()) {
+            std::vector<std::thread> threads;
+            std::mutex drawMutex;
+            std::atomic<size_t> faceIndex(0);
+
+
+            for (unsigned int t = 0; t < numThreads; ++t) {
+                threads.emplace_back([&, t]() {
+
+                    cv::CascadeClassifier& localEyeCascade = threadEyeCascades[t];
+                    cv::CascadeClassifier& localSmileCascade = threadSmileCascades[t];
+
+                    while (true) {
+
+                        size_t idx = faceIndex.fetch_add(1);
+                        if (idx >= faces.size()) break;
+
+                        const cv::Rect& face = faces[idx];
+
+                        cv::Rect smallFace(
+                            static_cast<int>(face.x * SCALE),
+                            static_cast<int>(face.y * SCALE),
+                            static_cast<int>(face.width * SCALE),
+                            static_cast<int>(face.height * SCALE)
+                        );
+
+                        smallFace.x = std::max(0, smallFace.x);
+                        smallFace.y = std::max(0, smallFace.y);
+                        smallFace.width = std::min(smallFace.width, gray.cols - smallFace.x);
+                        smallFace.height = std::min(smallFace.height, gray.rows - smallFace.y);
+
+                        if (smallFace.width < 30 || smallFace.height < 30) continue;
+
+                        cv::Mat faceROI = gray(smallFace).clone();
+
+                        // глаза
+                        std::vector<cv::Rect> eyes;
+                        localEyeCascade.detectMultiScale(
+                            faceROI,
+                            eyes,
+                            1.1,
+                            1,
+                            0,
+                            cv::Size(8, 8)
+                        );
+
+                        // улыбка
+                        cv::Rect mouthROI(
+                            static_cast<int>(faceROI.cols * 0.1),
+                            static_cast<int>(faceROI.rows * 0.55),
+                            static_cast<int>(faceROI.cols * 0.8),
+                            static_cast<int>(faceROI.rows * 0.4)
+                        );
+
+                        std::vector<cv::Rect> smiles;
+                        if (mouthROI.x >= 0 && mouthROI.y >= 0 &&
+                            mouthROI.x + mouthROI.width <= faceROI.cols &&
+                            mouthROI.y + mouthROI.height <= faceROI.rows &&
+                            mouthROI.width > 20 && mouthROI.height > 15) {
+
+                            cv::Mat smileROI = faceROI(mouthROI);
+                            localSmileCascade.detectMultiScale(
+                                smileROI,
+                                smiles,
+                                1.2,
+                                8,
+                                0,
+                                cv::Size(10, 8)
+                            );
+                        }
+
+
+                        {
+                            std::lock_guard<std::mutex> lock(drawMutex);
+
+                            for (const auto& eye : eyes) {
+                                if (eye.y + eye.height / 2 < faceROI.rows * 0.45) {
+                                    cv::Point center(
+                                        face.x + static_cast<int>(eye.x * scaleBack) + static_cast<int>(eye.width * scaleBack / 2),
+                                        face.y + static_cast<int>(eye.y * scaleBack) + static_cast<int>(eye.height * scaleBack / 2)
+                                    );
+                                    int radius = static_cast<int>(eye.width * scaleBack / 3);
+                                    cv::circle(frame, center, radius, cv::Scalar(255, 0, 0), 2);
+                                }
+                            }
+
+                            if (!smiles.empty()) {
+                                const auto& smile = smiles[0];
+                                cv::Rect scaledSmile(
+                                    face.x + static_cast<int>((mouthROI.x + smile.x) * scaleBack),
+                                    face.y + static_cast<int>((mouthROI.y + smile.y) * scaleBack),
+                                    static_cast<int>(smile.width * scaleBack),
+                                    static_cast<int>(smile.height * scaleBack)
+                                );
+
+                                cv::ellipse(frame,
+                                    cv::Point(scaledSmile.x + scaledSmile.width / 2,
+                                        scaledSmile.y + scaledSmile.height / 3),
+                                    cv::Size(scaledSmile.width / 2, scaledSmile.height / 2),
+                                    0, 0, 180,
+                                    cv::Scalar(0, 255, 255), 2);
+                            }
+                        }
+                    }
+                    });
+            }
+
+
+            for (auto& t : threads) {
+                if (t.joinable()) t.join();
+            }
+        }
+
+        // FPS
+        if (frameCount % 10 == 0) {
+            int64 endTick = cv::getTickCount();
+            double elapsed = (endTick - startTick) / cv::getTickFrequency();
+            if (elapsed > 0) {
+                fps = 10.0 / elapsed;
+            }
+            startTick = endTick;
+        }
+
+        std::string fpsText = "FPS: " + std::to_string(static_cast<int>(fps));
+        cv::putText(frame, fpsText, cv::Point(10, 30),
+            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+
+        std::string facesText = "Face: " + std::to_string(faces.size());
+        cv::putText(frame, facesText, cv::Point(10, 60),
+            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2);
+
+        if (paused) {
+            cv::putText(frame, "ПАУЗА", cv::Point(frame.cols - 150, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 3);
+        }
+
+        if (videoWriter.isOpened()) {
+            videoWriter.write(frame);
+        }
+
+        cv::imshow("Детекция лиц, глаз и улыбок", frame);
+
+        char key = cv::waitKey(1);
+        if (key == 27) {
+            std::cout << "Выход по нажатию ESC\n";
+            break;
+        }
+        if (key == 32) {
+            paused = !paused;
+            std::cout << (paused ? "ПАУЗА\n" : "ПРОДОЛЖЕНИЕ\n");
+        }
+        if (key == 's' || key == 'S') {
+            std::string filename = "screenshot_" + std::to_string(frameNumber) + ".png";
+            cv::imwrite(filename, frame);
+            std::cout << "Скриншот сохранён: " << filename << "\n";
+        }
+    }
+
+    
+    if (videoWriter.isOpened()) {
+        videoWriter.release();
+        std::cout << "Видео сохранено в: " << outputFilename << "\n";
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+
+    std::cout << "Обработано кадров: " << frameNumber << "\n";
+
+    system("pause");
+    return 0;
+}
